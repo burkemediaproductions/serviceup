@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api";
 import FieldInput from "../../components/FieldInput";
@@ -13,13 +13,59 @@ function slugify(value) {
     .replace(/^-+|-+$/g, "");
 }
 
+function normalizeConfig(cfg) {
+  if (!cfg) return {};
+  if (typeof cfg === "object") return cfg;
+  if (typeof cfg === "string") {
+    try {
+      return JSON.parse(cfg);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function getRoleFromToken() {
+  try {
+    const token =
+      window.localStorage.getItem("token") ||
+      window.localStorage.getItem("serviceup_token") ||
+      window.localStorage.getItem("jwt") ||
+      window.localStorage.getItem("authToken");
+
+    if (!token) return null;
+
+    const parts = String(token).split(".");
+    if (parts.length < 2) return null;
+
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = decodeURIComponent(
+      atob(b64)
+        .split("")
+        .map((c) => `%${("00" + c.charCodeAt(0).toString(16)).slice(-2)}`)
+        .join("")
+    );
+
+    const payload = JSON.parse(json);
+    return (
+      payload?.role ||
+      payload?.user?.role ||
+      payload?.claims?.role ||
+      payload?.app_metadata?.role ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build a layout from the editor view config + content type fields.
  * If no config exists, falls back to a single section with all fields.
  *
  * Updated: gracefully handle legacy editor view configs that store field references
- * under `field` or `field_key` instead of `key`.  Prefer the snake_case
- * `field_key` provided by the API when determining a field’s key.
+ * under `field` or `field_key` instead of `key`. Prefer `field_key` from API.
  */
 function buildLayoutFromView(contentType, viewConfig) {
   if (!contentType) return [];
@@ -29,7 +75,6 @@ function buildLayoutFromView(contentType, viewConfig) {
   const fields = rawFields
     .map((f) => {
       if (!f) return null;
-      // Normalize field definitions: prefer the snake_case field_key when present.
       const key = f.field_key || f.key;
       return key ? { ...f, key } : null;
     })
@@ -41,50 +86,50 @@ function buildLayoutFromView(contentType, viewConfig) {
   });
 
   const sections = [];
+
+  // IMPORTANT: distinguish between "no config provided" vs "config exists but empty"
   const cfgSections =
     viewConfig && Array.isArray(viewConfig.sections) ? viewConfig.sections : null;
+
+  const hasAnyViewSectionsConfig = Array.isArray(cfgSections);
 
   if (cfgSections && cfgSections.length) {
     for (const sec of cfgSections) {
       const rows = [];
-      // Each section can specify a layout (e.g. "two-column"). Fall back to columns if set.
+
       let columns = 1;
       if (typeof sec.layout === "string") {
         if (sec.layout.includes("two")) columns = 2;
         if (sec.layout.includes("three")) columns = 3;
       }
-      // If explicit columns property present, respect it
       if (sec.columns && Number.isInteger(sec.columns)) {
         columns = sec.columns;
       }
+
       for (const fCfgRaw of sec.fields || []) {
-        // Allow fields to be strings (field keys) or objects with key/width
         let key;
         let width = 1;
         let visible = true;
-        if (typeof fCfgRaw === "string") {
-          key = fCfgRaw;
-        } else if (fCfgRaw && typeof fCfgRaw === "object") {
-          // Legacy editor view configs saved the field under the "field" property.
-          // Prefer the explicit key but fall back to field or field_key if present.
-          key = fCfgRaw.key || fCfgRaw.field || fCfgRaw.field_key;
-          width = fCfgRaw.width || 1;
-          if (fCfgRaw.visible === false) visible = false;
+
+        if (typeof fCfgRaw === "string") key = fCfgRaw;
+        else if (typeof fCfgRaw === "object" && fCfgRaw) {
+          key = fCfgRaw.key || fCfgRaw.field_key || fCfgRaw.field || fCfgRaw.id;
+          width = fCfgRaw.width || fCfgRaw.colSpan || width;
+          if (typeof fCfgRaw.visible === "boolean") visible = fCfgRaw.visible;
         }
-        // Only include custom fields that exist in the content type
-        if (!key) continue;
-        const def = fieldsByKey[key];
-        if (!def) continue;
-        if (visible === false) continue;
-        rows.push({
-          def,
-          width,
-        });
+
+        if (!key || !visible) continue;
+
+        // built-ins come through as strings too, so allow them through
+        const def = fieldsByKey[key] || { key, type: "builtin" };
+
+        rows.push({ def, width });
       }
+
       if (rows.length) {
         sections.push({
-          id: sec.id || sec.title || `section-${sections.length}`,
-          title: sec.title || "",
+          id: sec.id || "section",
+          title: sec.title || "Section",
           columns,
           rows,
         });
@@ -92,8 +137,10 @@ function buildLayoutFromView(contentType, viewConfig) {
     }
   }
 
-  // Fallback: single section with all custom fields. Do not include built-ins
-  if (!sections.length && fields.length) {
+  // Fallback ONLY when there is NO view config at all.
+  // If a view exists but contains only built-ins (or invalid keys),
+  // we should NOT fall back to "all fields" because that looks like the wrong view loaded.
+  if (!sections.length && fields.length && !hasAnyViewSectionsConfig) {
     sections.push({
       id: "main",
       title: "Fields",
@@ -105,12 +152,158 @@ function buildLayoutFromView(contentType, viewConfig) {
   return sections;
 }
 
+
+// ✅ helper: normalize field config across legacy config/options shapes
+function getFieldConfig(def) {
+  return (
+    (def?.config && typeof def.config === "object" ? def.config : null) ||
+    (def?.options && typeof def.options === "object" ? def.options : null) ||
+    {}
+  );
+}
+
+// ✅ helper: read relationship target slug across common shapes
+function getRelationshipTargetSlug(field) {
+  const cfg =
+    (field?.config && typeof field.config === "object" ? field.config : null) ||
+    (field?.options && typeof field.options === "object" ? field.options : null) ||
+    {};
+
+  const v =
+    cfg?.relation?.contentType ||
+    cfg?.relation?.slug ||
+    cfg?.relatedType ||
+    cfg?.contentType ||
+    cfg?.targetType ||
+    cfg?.target ||
+    field?.relatedType ||
+    field?.contentType ||
+    null;
+
+  if (v && typeof v === "object") {
+    return v.slug || v.contentType || v.relatedType || null;
+  }
+
+  return v ? String(v) : null;
+}
+
+// ✅ helper: detect dynamic choice source slug
+function getDynamicChoiceSourceSlug(def) {
+  const cfg = getFieldConfig(def);
+  const sourceType = cfg?.sourceType || cfg?.source_type || null;
+  const optionsSource = cfg?.optionsSource || cfg?.options_source || null;
+
+  if (sourceType) return String(sourceType);
+  if (optionsSource === "dynamic" && cfg?.source) return String(cfg.source);
+  return null;
+}
+
+// ----------------------------
+// ✅ Derived title helpers
+// ----------------------------
+function getByPath(obj, path) {
+  if (!path) return undefined;
+  const parts = String(path)
+    .split(".")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+function asPrettyInline(value) {
+  if (value == null) return "";
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  )
+    return String(value);
+
+  // name field object common shape
+  if (typeof value === "object" && !Array.isArray(value)) {
+    const first = value.first || "";
+    const last = value.last || "";
+    const middle = value.middle || "";
+    const title = value.title || "";
+    const suffix = value.suffix || "";
+
+    const looksLikeName =
+      "first" in value ||
+      "last" in value ||
+      "middle" in value ||
+      "title" in value ||
+      "suffix" in value;
+
+    if (looksLikeName) {
+      const bits = [];
+      if (title) bits.push(String(title));
+      if (first) bits.push(String(first));
+      if (middle) bits.push(String(middle));
+      if (last) bits.push(String(last));
+      let out = bits.join(" ").trim();
+      if (suffix) out = `${out} ${suffix}`.trim();
+      return out;
+    }
+
+    // fallback
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(asPrettyInline).filter(Boolean).join(", ");
+  }
+
+  return String(value);
+}
+
+function deriveTitleFromTemplate(template, data) {
+  const tpl = String(template || "");
+  if (!tpl.trim()) return "";
+
+  // replace {path.to.field} tokens
+  const out = tpl.replace(/\{([^}]+)\}/g, (_, tokenRaw) => {
+    const token = String(tokenRaw || "").trim();
+    if (!token) return "";
+    const val = getByPath(data, token);
+    return asPrettyInline(val);
+  });
+
+  return out.replace(/\s+/g, " ").trim();
+}
+
 export default function Editor() {
   const { typeSlug, entryId } = useParams();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const roleUpper = "ADMIN".toUpperCase();
+  // ✅ only depend on the string value, not the searchParams object
+  const viewParam = searchParams.get("view") || "";
+  const setViewParamInUrl = useCallback(
+    (nextView) => {
+      const next = new URLSearchParams(searchParams);
+      if (nextView) next.set("view", nextView);
+      else next.delete("view");
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams]
+  );
+
+
+
+  const roleUpper = useMemo(() => {
+    const r = getRoleFromToken();
+    return String(r || "ADMIN").toUpperCase();
+  }, []);
 
   const isNew = !entryId || entryId === "new";
 
@@ -128,8 +321,11 @@ export default function Editor() {
   // Structured custom data from entries.data
   const [data, setData] = useState({});
 
-  // ✅ NEW: resolved payload from API (Option B)
-  // Shape: { usersById, userFields, ...future }
+  // Caches used by FieldInput for relation fields and dynamic choice sources
+  const [relatedCache, setRelatedCache] = useState({});
+  const [choicesCache, setChoicesCache] = useState({});
+
+  // ✅ resolved payload from API (Option B)
   const [resolved, setResolved] = useState(null);
 
   // Content type + editor view
@@ -140,6 +336,26 @@ export default function Editor() {
   const [activeViewLabel, setActiveViewLabel] = useState("");
 
   const overallLoading = loadingEntry || loadingType;
+
+  // ✅ core config (from EntryViews builder)
+  const coreCfg = useMemo(() => {
+    const c =
+      editorViewConfig?.core && typeof editorViewConfig.core === "object"
+        ? editorViewConfig.core
+        : {};
+    return {
+      titleLabel: c.titleLabel || "Title",
+      slugLabel: c.slugLabel || "Slug",
+      statusLabel: c.statusLabel || "Status",
+      titleMode: c.titleMode || "manual",
+      titleTemplate: c.titleTemplate || "",
+      hideTitle: !!c.hideTitle,
+      hideSlug: !!c.hideSlug,
+      hideStatus: !!c.hideStatus,
+      hidePreview: !!c.hidePreview,
+      autoSlugFromTitleIfEmpty: c.autoSlugFromTitleIfEmpty !== false,
+    };
+  }, [editorViewConfig]);
 
   // ---------------------------------------------------------------------------
   // Load content type (with fields) + editor views for the current role
@@ -152,53 +368,52 @@ export default function Editor() {
       setError("");
 
       try {
-        // 1) Load all content types and find the one by slug
         const res = await api.get("/api/content-types");
         const list = Array.isArray(res) ? res : res?.data || [];
 
         const basicCt =
           list.find(
             (t) =>
-              t.slug === typeSlug || t.slug?.toLowerCase() === typeSlug?.toLowerCase()
+              t.slug === typeSlug ||
+              t.slug?.toLowerCase() === typeSlug?.toLowerCase()
           ) || null;
 
         if (!basicCt) {
-          if (!cancelled) {
-            setError(`Content type "${typeSlug}" not found.`);
-          }
+          if (!cancelled) setError(`Content type "${typeSlug}" not found.`);
           return;
         }
-
         if (cancelled) return;
 
-        // 2) Load the full definition (including fields) by ID.
         let fullCt;
         try {
-          const fullRes = await api.get(`/api/content-types/${basicCt.id}?all=true`);
+          const fullRes = await api.get(
+            `/api/content-types/${basicCt.id}?all=true`
+          );
           fullCt = fullRes?.data || fullRes || basicCt;
         } catch (e) {
-          console.warn("Failed to load full content type, falling back to basic", e);
+          console.warn(
+            "Failed to load full content type, falling back to basic",
+            e
+          );
           fullCt = basicCt;
         }
 
         if (cancelled) return;
         setContentType(fullCt);
 
-        // 3) Load ALL editor views for this content type filtered by role
+        // editor views
         let views = [];
         if (fullCt && fullCt.id) {
           try {
             const vRes = await api.get(
-              `/api/content-types/${fullCt.id}/editor-views?role=${encodeURIComponent(
-                roleUpper
-              )}`
+              `/api/content-types/${
+                fullCt.id
+              }/editor-views?role=${encodeURIComponent(roleUpper)}&_=${Date.now()}`
             );
             const rawViews = vRes?.data ?? vRes;
-            if (Array.isArray(rawViews)) {
-              views = rawViews;
-            } else if (rawViews && Array.isArray(rawViews.views)) {
+            if (Array.isArray(rawViews)) views = rawViews;
+            else if (rawViews && Array.isArray(rawViews.views))
               views = rawViews.views;
-            }
           } catch (err) {
             console.warn(
               "[Editor] Failed to load editor views for type; falling back to auto layout",
@@ -206,17 +421,15 @@ export default function Editor() {
             );
           }
         }
-        if (!cancelled) {
-          setEditorViews(views || []);
-        }
 
-        // Determine which view to use: URL parameter or default roles
+        if (!cancelled) setEditorViews(views || []);
+
+        // choose view
         let chosenView = null;
         if (views && views.length) {
-          const viewFromUrl = searchParams.get("view") || "";
           const defaultView =
             views.find((v) => {
-              const cfg = v.config || {};
+              const cfg = normalizeConfig(v.config || {});
               const dRoles = Array.isArray(cfg.default_roles)
                 ? cfg.default_roles.map((r) => String(r || "").toUpperCase())
                 : [];
@@ -224,8 +437,8 @@ export default function Editor() {
               return !!v.is_default;
             }) || views[0];
 
-          if (viewFromUrl) {
-            const fromUrl = views.find((v) => v.slug === viewFromUrl);
+          if (viewParam) {
+            const fromUrl = views.find((v) => v.slug === viewParam);
             chosenView = fromUrl || defaultView;
           } else {
             chosenView = defaultView;
@@ -236,45 +449,43 @@ export default function Editor() {
           if (!cancelled) {
             setActiveViewSlug(chosenView.slug);
             setActiveViewLabel(
-              chosenView.label || chosenView.name || chosenView.title || chosenView.slug
+              chosenView.label ||
+                chosenView.name ||
+                chosenView.title ||
+                chosenView.slug
             );
-            setEditorViewConfig(chosenView.config || {});
+            setEditorViewConfig(normalizeConfig(chosenView.config));
           }
-          const currentViewParam = searchParams.get("view");
-          if (currentViewParam !== chosenView.slug) {
-            const next = new URLSearchParams(searchParams);
-            next.set("view", chosenView.slug);
-            setSearchParams(next);
-          }
+
+          // ✅ keep URL in sync, but only when needed
+          if (viewParam !== chosenView.slug) {
+           setViewParamInUrl(chosenView.slug);
+         }
         } else {
           if (!cancelled) {
             setActiveViewSlug("");
             setActiveViewLabel("");
             setEditorViewConfig({});
           }
-          if (searchParams.get("view")) {
-            const next = new URLSearchParams(searchParams);
-            next.delete("view");
-            setSearchParams(next);
+          if (viewParam) {
+            setViewParamInUrl("");
           }
         }
       } catch (err) {
         console.error("Failed to load content types", err);
-        if (!cancelled) {
+        if (!cancelled)
           setError(err.message || "Failed to load content type");
-        }
       } finally {
         if (!cancelled) setLoadingType(false);
       }
     }
 
     loadTypeAndView();
-
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [typeSlug]);
+  }, [typeSlug, roleUpper, viewParam]);
 
   const sections = useMemo(
     () => buildLayoutFromView(contentType, editorViewConfig),
@@ -282,16 +493,100 @@ export default function Editor() {
   );
 
   // ---------------------------------------------------------------------------
+  // ✅ Build caches for relationship fields + dynamic choice sources
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadCaches() {
+      const fields = Array.isArray(contentType?.fields) ? contentType.fields : [];
+      if (!fields.length) {
+        setRelatedCache({});
+        setChoicesCache({});
+        return;
+      }
+
+      const relSlugs = new Set();
+      const choiceSlugs = new Set();
+
+      for (const f of fields) {
+        const type = String(f?.type || "").toLowerCase();
+
+        if (type === "relation" || type === "relationship") {
+          const slug = getRelationshipTargetSlug(f);
+          if (slug) relSlugs.add(slug);
+        }
+
+        const isChoice = ["radio", "dropdown", "checkbox", "select", "multiselect"].includes(type);
+        if (isChoice) {
+          const cfg = getFieldConfig(f);
+          const sourceType = cfg?.sourceType || cfg?.source_type;
+          const optionsSource = cfg?.optionsSource || cfg?.options_source;
+
+          if (sourceType || optionsSource === "dynamic") {
+            const sourceSlug = getDynamicChoiceSourceSlug(f);
+            if (sourceSlug) choiceSlugs.add(String(sourceSlug));
+          }
+        }
+      }
+
+      async function fetchList(slug) {
+        const res = await api.get(`/api/content/${encodeURIComponent(slug)}?limit=200`);
+        const data = res?.data ?? res;
+
+        const list =
+          data?.entries ||
+          data?.items ||
+          (Array.isArray(data) ? data : null) ||
+          [];
+
+        return Array.isArray(list) ? list : [];
+      }
+
+      const nextRelated = {};
+      for (const slug of relSlugs) {
+        try {
+          if (cancelled) return;
+          nextRelated[slug] = await fetchList(slug);
+        } catch {
+          nextRelated[slug] = [];
+        }
+      }
+
+      const nextChoices = {};
+      for (const slug of choiceSlugs) {
+        try {
+          if (cancelled) return;
+          nextChoices[slug] = await fetchList(slug);
+        } catch {
+          nextChoices[slug] = [];
+        }
+      }
+
+      if (!cancelled) {
+        setRelatedCache(nextRelated);
+        setChoicesCache(nextChoices);
+      }
+    }
+
+    loadCaches();
+
+    return () => {
+      cancelled = true;
+    };
+    // ✅ avoid refetch loops from array identity churn
+  }, [contentType?.id]);
+
+  // ---------------------------------------------------------------------------
   // Load existing entry (edit mode only)
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (isNew) {
-      // new entry: clear entry state but keep content type data
       setTitle("");
       setSlug("");
       setStatus("draft");
       setData({});
-      setResolved(null); // ✅ clear resolved for new entry
+      setResolved(null);
       setLoadingEntry(false);
       return;
     }
@@ -310,18 +605,12 @@ export default function Editor() {
         const entry = res.entry || res.data || res;
         if (cancelled) return;
 
-        // ✅ capture Option B resolved payload
         setResolved(entry?._resolved || null);
 
-        // Start from entry.data if present
         const rawData =
           entry && typeof entry.data === "object" && entry.data !== null ? entry.data : {};
-
         let entryData = rawData && typeof rawData === "object" ? { ...rawData } : {};
 
-        // Merge in any extra keys from the top-level entry that
-        // are not system columns. This handles cases where the API
-        // (or older data) stored custom fields directly on the row.
         const SYSTEM_KEYS = new Set([
           "id",
           "content_type_id",
@@ -337,41 +626,27 @@ export default function Editor() {
           "version",
           "version_of",
           "published_at",
-          "_resolved", // ✅ prevent resolved from being merged into data
+          "_resolved",
         ]);
 
         Object.entries(entry || {}).forEach(([k, v]) => {
           if (SYSTEM_KEYS.has(k)) return;
-          if (entryData[k] === undefined) {
-            entryData[k] = v;
-          }
+          if (entryData[k] === undefined) entryData[k] = v;
         });
 
-        // Flatten nested "undefined" buckets recursively (legacy shape)
         while (
           entryData &&
           typeof entryData === "object" &&
           entryData.undefined &&
           typeof entryData.undefined === "object"
         ) {
-          entryData = {
-            ...entryData,
-            ...entryData.undefined,
-          };
+          entryData = { ...entryData, ...entryData.undefined };
           delete entryData.undefined;
         }
 
-        // 🔍 DEBUG
-        console.log("[Editor] Loaded entry from API", { typeSlug, entryId, entry });
-        console.log("[Editor] entry._resolved from API", entry?._resolved);
-        console.log("[Editor] entry.data from API", rawData);
-        console.log("[Editor] entryData after merge/flatten", entryData);
-
-        // Derive core fields, but prefer the top-level columns if present
         const loadedTitle = entry.title ?? entryData.title ?? entryData._title ?? "";
         const loadedSlug = entry.slug ?? entryData.slug ?? entryData._slug ?? "";
-        const loadedStatus =
-          entry.status ?? entryData.status ?? entryData._status ?? "draft";
+        const loadedStatus = entry.status ?? entryData.status ?? entryData._status ?? "draft";
 
         setTitle(loadedTitle);
         setSlug(loadedSlug);
@@ -379,41 +654,60 @@ export default function Editor() {
         setData(entryData || {});
       } catch (err) {
         console.error("Failed to load entry", err);
-        if (!cancelled) {
-          setError(err.message || "Failed to load entry");
-        }
+        if (!cancelled) setError(err.message || "Failed to load entry");
       } finally {
         if (!cancelled) setLoadingEntry(false);
       }
     }
 
     load();
-
     return () => {
       cancelled = true;
     };
   }, [isNew, typeSlug, entryId]);
 
   // ---------------------------------------------------------------------------
+  // ✅ Derive Title live from template (if enabled in view)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!coreCfg) return;
+    if ((coreCfg.titleMode || "manual") !== "template") return;
+
+    const derived = deriveTitleFromTemplate(coreCfg.titleTemplate || "", data || {});
+    if (!derived) return;
+
+    setTitle(derived);
+
+    if (coreCfg.autoSlugFromTitleIfEmpty && !String(slug || "").trim()) {
+      setSlug(slugify(derived));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coreCfg.titleMode, coreCfg.titleTemplate, data]);
+
+  // ---------------------------------------------------------------------------
   // Save / Delete
   // ---------------------------------------------------------------------------
-
   async function handleSave(e) {
     e.preventDefault();
     setError("");
     setSaveMessage("");
 
-    if (!title.trim()) {
+    const computedTitle =
+      (coreCfg.titleMode === "template"
+        ? deriveTitleFromTemplate(coreCfg.titleTemplate || "", data || {})
+        : title) || "";
+
+    if (!computedTitle.trim()) {
       setError("Title is required.");
       return;
     }
 
-    const finalSlug = slug.trim() || slugify(title);
+    // ✅ always slugify user-provided slug, or derive from title
+    const finalSlug = slugify((slug || "").trim() || computedTitle);
 
     try {
       setSaving(true);
 
-      // Sanitize existing data: drop bogus / legacy keys
       const sanitized = {};
       if (data && typeof data === "object") {
         Object.entries(data).forEach(([k, v]) => {
@@ -424,31 +718,28 @@ export default function Editor() {
 
       const mergedData = {
         ...sanitized,
-        title: title.trim(),
+        title: computedTitle.trim(),
         slug: finalSlug,
         status,
-        _title: title.trim(),
+        _title: computedTitle.trim(),
         _slug: finalSlug,
         _status: status,
       };
 
       const payload = {
-        title: title.trim(),
+        title: computedTitle.trim(),
         slug: finalSlug,
         status,
         data: mergedData,
       };
 
       if (isNew) {
-        // CREATE
         const res = await api.post(`/api/content/${typeSlug}`, payload);
         if (res && res.ok === false) {
           throw new Error(res.error || res.detail || "Failed to create entry");
         }
 
         const created = res.entry || res.data || res;
-
-        // ✅ capture resolved payload returned by API on create
         setResolved(created?._resolved || null);
 
         const newId = created?.id ?? created?.entry?.id ?? created?.data?.id ?? null;
@@ -456,28 +747,25 @@ export default function Editor() {
           created?.slug ?? created?.entry?.slug ?? created?.data?.slug ?? finalSlug;
 
         if (newId) {
-          const slugOrId = newSlug || newId;
-          navigate(`/admin/content/${typeSlug}/${slugOrId}`, { replace: true });
+          navigate(`/admin/content/${typeSlug}/${newSlug || newId}`, { replace: true });
           setSaveMessage("Entry created.");
         } else {
           setSaveMessage("Entry created (reload list to see it).");
         }
       } else {
-        // UPDATE
         const res = await api.put(`/api/content/${typeSlug}/${entryId}`, payload);
         if (res && res.ok === false) {
           throw new Error(res.error || res.detail || "Failed to save entry");
         }
 
         const updated = res.entry || res.data || res;
-
-        // ✅ capture resolved payload returned by API on update
         setResolved(updated?._resolved || null);
 
         if (updated) {
           const entryData = updated.data || mergedData;
 
-          const loadedTitle = updated.title ?? entryData.title ?? entryData._title ?? title;
+          const loadedTitle =
+            updated.title ?? entryData.title ?? entryData._title ?? computedTitle;
           const loadedSlug = updated.slug ?? entryData.slug ?? entryData._slug ?? finalSlug;
           const loadedStatus =
             updated.status ?? entryData.status ?? entryData._status ?? status;
@@ -487,12 +775,8 @@ export default function Editor() {
           setStatus(loadedStatus);
           setData(entryData);
 
-          // If slug changed, update the URL for consistency
-          const currentSlugParam = entryId;
-          if (loadedSlug && loadedSlug !== currentSlugParam) {
-            navigate(`/admin/content/${typeSlug}/${loadedSlug}`, {
-              replace: true,
-            });
+          if (loadedSlug && loadedSlug !== entryId) {
+            navigate(`/admin/content/${typeSlug}/${loadedSlug}`, { replace: true });
           }
         }
 
@@ -512,14 +796,13 @@ export default function Editor() {
       return;
     }
 
-    if (!window.confirm("Delete this entry? This cannot be undone.")) {
-      return;
-    }
+    if (!window.confirm("Delete this entry? This cannot be undone.")) return;
 
     try {
       setSaving(true);
       setSaveMessage("");
-      const res = await api.del(`/api/content/${typeSlug}/${entryId}`);
+      // NOTE: api wrappers typically use `.delete`, not `.del`
+      const res = await api.delete(`/api/content/${typeSlug}/${entryId}`);
       if (res && res.ok === false) {
         throw new Error(res.error || res.detail || "Failed to delete entry");
       }
@@ -535,18 +818,11 @@ export default function Editor() {
   // ---------------------------------------------------------------------------
   // Preview helpers
   // ---------------------------------------------------------------------------
-
   const previewData = useMemo(
-    () => ({
-      ...data,
-      title,
-      slug,
-      status,
-    }),
+    () => ({ ...data, title, slug, status }),
     [data, title, slug, status]
   );
 
-  // Build quick lookup of field defs (for pretty preview formatting)
   const fieldDefByKey = useMemo(() => {
     const map = {};
     const f = Array.isArray(contentType?.fields) ? contentType.fields : [];
@@ -557,7 +833,11 @@ export default function Editor() {
     return map;
   }, [contentType]);
 
-  const customFieldEntries = useMemo(() => Object.entries(data || {}), [data]);
+  // ✅ hide system-ish keys from the preview list
+  const customFieldEntries = useMemo(() => {
+    const SYSTEM = new Set(["title", "slug", "status", "_title", "_slug", "_status"]);
+    return Object.entries(data || {}).filter(([k]) => !SYSTEM.has(k));
+  }, [data]);
 
   function userLabelFromResolved(user, display) {
     if (!user) return "";
@@ -568,44 +848,14 @@ export default function Editor() {
     return name && email ? `${name} — ${email}` : name || email || "";
   }
 
-  function prettyValueForField(key, v) {
-    const def = fieldDefByKey[key];
-    const type = String(def?.type || "").toLowerCase();
-
-    // ✅ nicer preview for relation_user
-    if (type === "relation_user") {
-      const userFields = resolved?.userFields || {};
-      const usersById = resolved?.usersById || {};
-      const cfg = userFields[key] || def?.config || {};
-      const display = cfg?.display || "name_email";
-
-      if (Array.isArray(v)) {
-        const labels = v
-          .map((id) => userLabelFromResolved(usersById[id], display) || String(id))
-          .filter(Boolean);
-        return labels.join(", ");
-      }
-
-      if (typeof v === "string") {
-        return userLabelFromResolved(usersById[v], display) || v;
-      }
-      return "";
-    }
-
-    // default pretty formatting
-    return prettyValue(v);
-  }
-
   function prettyValue(v) {
     if (v === null || v === undefined) return "";
-    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean")
       return String(v);
-    }
     if (Array.isArray(v)) {
       if (!v.length) return "";
-      if (v.every((x) => typeof x === "string" || typeof x === "number")) {
+      if (v.every((x) => typeof x === "string" || typeof x === "number"))
         return v.join(", ");
-      }
       return JSON.stringify(v);
     }
     if (typeof v === "object") {
@@ -618,10 +868,35 @@ export default function Editor() {
     return String(v);
   }
 
+  function prettyValueForField(key, v) {
+    const def = fieldDefByKey[key];
+    const type = String(def?.type || "").toLowerCase();
+
+    if (type === "relation_user") {
+      const userFields = resolved?.userFields || {};
+      const usersById = resolved?.usersById || {};
+      const cfg = userFields[key] || def?.config || {};
+      const display = cfg?.display || "name_email";
+
+      if (Array.isArray(v)) {
+        return v
+          .map((id) => userLabelFromResolved(usersById[id], display) || String(id))
+          .filter(Boolean)
+          .join(", ");
+      }
+
+      if (typeof v === "string") {
+        return userLabelFromResolved(usersById[v], display) || v;
+      }
+      return "";
+    }
+
+    return prettyValue(v);
+  }
+
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
-
   return (
     <div className="su-grid cols-2">
       {/* LEFT: Editor card */}
@@ -630,17 +905,17 @@ export default function Editor() {
           {overallLoading ? "Edit entry" : isNew ? `New ${typeSlug} entry` : `Edit ${typeSlug}`}
         </h2>
 
-        {/* Editor view selector */}
         {editorViews.length > 0 && (
           <div className="su-card su-mb-md">
             <div className="su-card-body su-flex su-flex-wrap su-gap-sm su-items-center">
               <span className="su-text-sm su-text-muted">Views:</span>
               {editorViews.map((v) => {
-                const cfg = v.config || {};
+                const cfg = normalizeConfig(v.config || {});
                 const dRoles = Array.isArray(cfg.default_roles)
                   ? cfg.default_roles.map((r) => String(r || "").toUpperCase())
                   : [];
                 const isDefaultForRole = dRoles.length ? dRoles.includes(roleUpper) : !!v.is_default;
+
                 return (
                   <button
                     key={v.slug}
@@ -648,12 +923,8 @@ export default function Editor() {
                     className={"su-chip" + (v.slug === activeViewSlug ? " su-chip--active" : "")}
                     onClick={() => {
                       if (v.slug === activeViewSlug) return;
-                      setActiveViewSlug(v.slug);
-                      setActiveViewLabel(v.label || v.name || v.title || v.slug);
-                      setEditorViewConfig(v.config || {});
-                      const next = new URLSearchParams(searchParams);
-                      next.set("view", v.slug);
-                      setSearchParams(next);
+                      // ✅ drive selection via URL param; loader effect will apply config
+                      setViewParamInUrl(v.slug);
                     }}
                   >
                     {v.label || v.name || v.title || v.slug}
@@ -702,37 +973,49 @@ export default function Editor() {
         <form onSubmit={handleSave}>
           {/* Core fields */}
           <div style={{ display: "grid", gap: 12, marginBottom: 20 }}>
-            <label style={{ fontSize: 13 }}>
-              Title
-              <input
-                className="su-input"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="My great entry"
-              />
-            </label>
+            {!coreCfg.hideTitle && (
+              <label style={{ fontSize: 13 }}>
+                {coreCfg.titleLabel || "Title"}
+                <input
+                  className="su-input"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  placeholder="My great entry"
+                  disabled={coreCfg.titleMode === "template"}
+                />
+              </label>
+            )}
 
-            <label style={{ fontSize: 13 }}>
-              Slug
-              <input
-                className="su-input"
-                value={slug}
-                onChange={(e) => setSlug(e.target.value)}
-                placeholder={slugify(title || "my-entry")}
-              />
-            </label>
+            {!coreCfg.hideSlug && (
+              <label style={{ fontSize: 13 }}>
+                {coreCfg.slugLabel || "Slug"}
+                <input
+                  className="su-input"
+                  value={slug}
+                  // ✅ keep slugs clean as the user types
+                  onChange={(e) => setSlug(slugify(e.target.value))}
+                  placeholder={slugify(title || "my-entry")}
+                />
+              </label>
+            )}
 
-            <label style={{ fontSize: 13 }}>
-              Status
-              <select className="su-select" value={status} onChange={(e) => setStatus(e.target.value)}>
-                <option value="draft">Draft</option>
-                <option value="published">Published</option>
-                <option value="archived">Archived</option>
-              </select>
-            </label>
+            {!coreCfg.hideStatus && (
+              <label style={{ fontSize: 13 }}>
+                {coreCfg.statusLabel || "Status"}
+                <select
+                  className="su-select"
+                  value={status}
+                  onChange={(e) => setStatus(e.target.value)}
+                >
+                  <option value="draft">Draft</option>
+                  <option value="published">Published</option>
+                  <option value="archived">Archived</option>
+                </select>
+              </label>
+            )}
           </div>
 
-          {/* Structured fields powered by QuickBuilder + Editor Views */}
+          {/* Structured fields */}
           <div style={{ marginBottom: 16 }}>
             <div
               style={{
@@ -782,6 +1065,7 @@ export default function Editor() {
                     const key = def && def.key;
                     if (!key) return null;
                     const value = data ? data[key] : undefined;
+
                     return (
                       <div key={key} style={{ gridColumn: `span ${width || 1}` }}>
                         <div style={{ display: "grid", gap: 6 }}>
@@ -792,15 +1076,14 @@ export default function Editor() {
                           <FieldInput
                             field={def}
                             value={value}
-                            // ✅ NEW: pass resolved payload so relation_user can render labels / picker
-                            resolved={resolved}
                             onChange={(val) => {
                               if (!key) return;
-                              setData((prev) => ({
-                                ...(prev || {}),
-                                [key]: val,
-                              }));
+                              setData((prev) => ({ ...(prev || {}), [key]: val }));
                             }}
+                            relatedCache={relatedCache}
+                            choicesCache={choicesCache}
+                            resolved={resolved}
+                            entryContext={{ typeSlug, entryId }}
                           />
 
                           {(def.help || def.description) && (
@@ -842,70 +1125,72 @@ export default function Editor() {
         </form>
       </div>
 
-      {/* RIGHT: Preview card */}
-      <div className="su-card">
-        <h2 style={{ marginTop: 0, marginBottom: 12 }}>Preview</h2>
+      {/* RIGHT: Preview card (can be hidden by view config) */}
+      {!coreCfg.hidePreview && (
+        <div className="su-card">
+          <h2 style={{ marginTop: 0, marginBottom: 12 }}>Preview</h2>
 
-        {/* "Physical" preview */}
-        <div
-          style={{
-            borderRadius: 10,
-            border: "1px solid var(--su-border)",
-            padding: 12,
-            marginBottom: 16,
-          }}
-        >
-          <div style={{ marginBottom: 8 }}>
-            <div style={{ fontSize: 16, fontWeight: 600 }}>{title || "(untitled entry)"}</div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>
-              /{slug || slugify(title || "my-entry")} ·{" "}
-              <span style={{ textTransform: "uppercase" }}>{status}</span>
+          <div
+            style={{
+              borderRadius: 10,
+              border: "1px solid var(--su-border)",
+              padding: 12,
+              marginBottom: 16,
+            }}
+          >
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 16, fontWeight: 600 }}>
+                {title || "(untitled entry)"}
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.7 }}>
+                /{slug || slugify(title || "my-entry")} ·{" "}
+                <span style={{ textTransform: "uppercase" }}>{status}</span>
+              </div>
+            </div>
+
+            <div style={{ borderTop: "1px solid var(--su-border)", paddingTop: 8 }}>
+              {customFieldEntries.length === 0 && (
+                <p style={{ fontSize: 12, opacity: 0.7 }}>No fields yet.</p>
+              )}
+
+              {customFieldEntries.map(([k, v]) => (
+                <div
+                  key={k}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "120px minmax(0,1fr)",
+                    gap: 8,
+                    padding: "4px 0",
+                    fontSize: 13,
+                  }}
+                >
+                  <div style={{ opacity: 0.7 }}>{k}</div>
+                  <div>{prettyValueForField(k, v)}</div>
+                </div>
+              ))}
             </div>
           </div>
 
-          <div style={{ borderTop: "1px solid var(--su-border)", paddingTop: 8 }}>
-            {customFieldEntries.length === 0 && (
-              <p style={{ fontSize: 12, opacity: 0.7 }}>No fields yet.</p>
-            )}
-
-            {customFieldEntries.map(([key, value]) => (
-              <div
-                key={key}
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "120px minmax(0,1fr)",
-                  gap: 8,
-                  padding: "4px 0",
-                  fontSize: 13,
-                }}
-              >
-                <div style={{ opacity: 0.7 }}>{key}</div>
-                <div>{prettyValueForField(key, value)}</div>
-              </div>
-            ))}
-          </div>
+          <h3 style={{ marginTop: 0, marginBottom: 8, fontSize: 14 }}>
+            Raw JSON (<code>entries.data</code>)
+          </h3>
+          <pre
+            style={{
+              fontSize: 11,
+              background: "#0b1120",
+              color: "#d1fae5",
+              borderRadius: 10,
+              padding: 10,
+              maxHeight: 480,
+              overflow: "auto",
+              fontFamily:
+                'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+            }}
+          >
+            {JSON.stringify(previewData, null, 2)}
+          </pre>
         </div>
-
-        {/* JSON preview */}
-        <h3 style={{ marginTop: 0, marginBottom: 8, fontSize: 14 }}>
-          Raw JSON (<code>entries.data</code>)
-        </h3>
-        <pre
-          style={{
-            fontSize: 11,
-            background: "#0b1120",
-            color: "#d1fae5",
-            borderRadius: 10,
-            padding: 10,
-            maxHeight: 480,
-            overflow: "auto",
-            fontFamily:
-              'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-          }}
-        >
-          {JSON.stringify(previewData, null, 2)}
-        </pre>
-      </div>
+      )}
     </div>
   );
 }

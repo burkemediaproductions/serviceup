@@ -1,5 +1,4 @@
-// admin/src/pages/ContentTypes/QuickBuilder.jsx
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
 
 // === FIELD TYPES (from old QuickBuilder shim) ===
@@ -36,6 +35,7 @@ const RAW_FIELD_TYPES = [
   "tags",
   "relation_user",
   "taxonomy",
+  "repeater",
 ];
 
 function labelFromFieldType(type) {
@@ -54,6 +54,8 @@ function labelFromFieldType(type) {
       return "Iframe embed";
     case "relation_user":
       return "User relation";
+    case "repeater":
+      return "Repeater";
     default:
       return type
         .replace(/_/g, " ")
@@ -202,6 +204,14 @@ const EMPTY_TYPE = {
   icon: "",
 };
 
+function safeJsonParse(text) {
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (e) {
+    return { ok: false, error: e?.message || "Invalid JSON" };
+  }
+}
+
 export default function QuickBuilderPage() {
   const [types, setTypes] = useState([]);
   const [loadingTypes, setLoadingTypes] = useState(true);
@@ -300,8 +310,8 @@ export default function QuickBuilderPage() {
             const normalizedConfig = {
               ...cfg,
               // Support both shapes:
-              // - config.choices (canonical in ServiceUp admin UI)
-              // - config.options (older/SQL/import shape)
+              // - config.choices (canonical)
+              // - config.options (older)
               choices: cfg.choices ?? cfg.options ?? null,
               options: cfg.options ?? cfg.choices ?? null,
             };
@@ -529,36 +539,115 @@ export default function QuickBuilderPage() {
             setError("");
             setActiveFieldIndex(null);
           }}
-          className={
-            "w-full rounded px-2 py-1 text-left text-sm " +
-            (isActive ? "bg-blue-50 text-blue-700" : "hover:bg-gray-50")
-          }
+          className={"qb-typeBtn " + (isActive ? "is-active" : "")}
         >
-          <div className="flex flex-col gap-[2px]">
-            <span>
-              {mainLabel}
-              {isTaxonomy ? " · Taxonomy" : ""}
-            </span>
-            {t.slug && (
-              <span className="text-[11px] text-gray-500">{t.slug}</span>
-            )}
+          <div className="qb-typeBtnInner">
+            <div className="qb-typeBtnLabelRow">
+              <span className="qb-typeBtnLabel">{mainLabel}</span>
+              {isTaxonomy && <span className="qb-typeBtnMeta">Taxonomy</span>}
+            </div>
+
+            {t.slug && <div className="qb-typeBtnSlug">{t.slug}</div>}
           </div>
         </button>
       </li>
     );
   };
 
-  // === FIELD CONFIG EDITOR (per selected row) ===
+  const REPEATER_OPERATORS = [
+    { value: "equals", label: "equals" },
+    { value: "not_equals", label: "not equals" },
+    { value: "contains", label: "contains" },
+    { value: "not_contains", label: "not contains" },
+    { value: "gt", label: ">" },
+    { value: "gte", label: ">=" },
+    { value: "lt", label: "<" },
+    { value: "lte", label: "<=" },
+    { value: "truthy", label: "is filled (truthy)" },
+    { value: "falsy", label: "is empty (falsy)" },
+  ];
+
   function FieldConfigEditor({ field, onChange }) {
     if (!field) return null;
+
     const cfg =
-      field.config && typeof field.config === "object" ? { ...field.config } : {};
+      field.config && typeof field.config === "object"
+        ? { ...field.config }
+        : {};
 
     const type = field.type || "text";
+
+    // --- Relationship inline-edit support (Option B) ---
+    const isRelationType = ["relationship", "relation"].includes(type);
+
+    // For our picker population, we treat `cfg.relatedType` as the slug.
+    const relatedSlug = String(cfg.relatedType || "").trim();
+
+    const relatedTypeObj = useMemo(() => {
+      if (!relatedSlug) return null;
+      return (
+        (types || []).find((t) => String(t.slug || "") === relatedSlug) || null
+      );
+    }, [types, relatedSlug]);
+
+    const [relatedFields, setRelatedFields] = useState([]);
+    const [loadingRelatedFields, setLoadingRelatedFields] = useState(false);
+
+    useEffect(() => {
+      let cancelled = false;
+
+      async function loadRelatedFields() {
+        try {
+          setLoadingRelatedFields(true);
+
+          if (!relatedTypeObj?.id) {
+            setRelatedFields([]);
+            return;
+          }
+
+          const data = await api.get(`/api/content-types/${relatedTypeObj.id}`);
+          if (cancelled) return;
+
+          const list = (data?.fields || [])
+            .map((f) => ({
+              key: String(f.field_key || "").trim(),
+              label: String(f.label || f.field_key || "").trim(),
+              type: String(f.type || "").trim(),
+            }))
+            .filter((x) => x.key);
+
+          setRelatedFields(list);
+        } catch (e) {
+          console.error(e);
+          if (!cancelled) setRelatedFields([]);
+        } finally {
+          if (!cancelled) setLoadingRelatedFields(false);
+        }
+      }
+
+      if (isRelationType && relatedSlug) loadRelatedFields();
+      else setRelatedFields([]);
+
+      return () => {
+        cancelled = true;
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isRelationType, relatedTypeObj?.id, relatedSlug]);
 
     function updateCfg(patch) {
       onChange({ ...cfg, ...patch });
     }
+
+    function updateInlineEdit(patch) {
+      const current =
+        cfg.inlineEdit && typeof cfg.inlineEdit === "object"
+          ? { ...cfg.inlineEdit }
+          : {};
+      updateCfg({ inlineEdit: { ...current, ...patch } });
+    }
+
+    const inlineEdit =
+      cfg.inlineEdit && typeof cfg.inlineEdit === "object" ? cfg.inlineEdit : {};
 
     // Choice helpers
     function choicesToText(c) {
@@ -590,13 +679,85 @@ export default function QuickBuilderPage() {
         .filter(Boolean);
     }
 
+    // ✅ Repeater subfield controls
+    function updateRepeaterSubfield(i, patch) {
+      const next = Array.isArray(cfg.subfields) ? [...cfg.subfields] : [];
+      next[i] = { ...(next[i] || {}), ...patch };
+      updateCfg({ subfields: next });
+    }
+
+    function removeRepeaterSubfield(i) {
+      const next = (Array.isArray(cfg.subfields) ? [...cfg.subfields] : []).filter(
+        (_, idx) => idx !== i
+      );
+      updateCfg({ subfields: next });
+    }
+
+    function addRepeaterSubfield() {
+      const next = Array.isArray(cfg.subfields) ? [...cfg.subfields] : [];
+      next.push({
+        field_key: "",
+        label: "",
+        type: "text",
+        required: false,
+        help_text: "",
+        config: {},
+      });
+      updateCfg({ subfields: next });
+    }
+
+    const maxDepth = Number.isFinite(cfg.maxDepth) ? Number(cfg.maxDepth) : 2;
+
+    const repeaterLayout = cfg.layout || "cards"; // cards | table
+
+    // Conditional rules (per row)
+    function updateRule(i, patch) {
+      const rules = Array.isArray(cfg.rules) ? [...cfg.rules] : [];
+      rules[i] = { ...(rules[i] || {}), ...patch };
+      updateCfg({ rules });
+    }
+    function addRule() {
+      const rules = Array.isArray(cfg.rules) ? [...cfg.rules] : [];
+      rules.push({
+        ifKey: "",
+        op: "equals",
+        value: "",
+        action: "show",
+        targets: [],
+      });
+      updateCfg({ rules });
+    }
+    function removeRule(i) {
+      const rules = (Array.isArray(cfg.rules) ? [...cfg.rules] : []).filter(
+        (_, idx) => idx !== i
+      );
+      updateCfg({ rules });
+    }
+
+    const availableTargets = useMemo(() => {
+      const subs = Array.isArray(cfg.subfields) ? cfg.subfields : [];
+      return subs.map((s) => String(s?.field_key || "").trim()).filter(Boolean);
+    }, [cfg.subfields]);
+
+    const relatedFieldOptions = useMemo(() => {
+      // We only want real field keys (not empty). We keep label handy for nicer display.
+      return (relatedFields || []).map((f) => ({
+        key: f.key,
+        label: f.label || f.key,
+        type: f.type || "",
+      }));
+    }, [relatedFields]);
+
+    const inlineAllowedFields = Array.isArray(inlineEdit.fields)
+      ? inlineEdit.fields
+      : [];
+
     return (
       <div className="mt-4 rounded-lg border border-gray-200 bg-gray-50 p-4 text-sm">
         <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
           Field config — {field.label || field.field_key || "(untitled)"}
         </div>
 
-        {/* Choice-based fields */}
         {["radio", "dropdown", "checkbox", "select", "multiselect"].includes(
           type
         ) && (
@@ -617,7 +778,6 @@ export default function QuickBuilderPage() {
           </div>
         )}
 
-        {/* Tags suggestions */}
         {type === "tags" && (
           <div className="mb-4 space-y-1">
             <div className="font-medium">Tag suggestions</div>
@@ -640,51 +800,209 @@ export default function QuickBuilderPage() {
           </div>
         )}
 
-        {/* Relationship config */}
         {["relationship", "relation"].includes(type) && (
-          <div className="mb-4 grid gap-3 md:grid-cols-2">
-            <label className="space-y-1">
-              <span className="font-medium">Related content type slug</span>
-              <input
-                className="su-input"
-                value={cfg.relatedType || ""}
-                onChange={(e) => updateCfg({ relatedType: e.target.value })}
-                placeholder="movie, song, etc."
-              />
-            </label>
-            <div className="space-y-2">
-              <label className="flex items-center gap-2 text-xs">
+          <>
+            <div className="mb-4 grid gap-3 md:grid-cols-2">
+              <label className="space-y-1">
+                <span className="font-medium">Related content type slug</span>
                 <input
-                  type="checkbox"
-                  checked={!!cfg.multiple}
-                  onChange={(e) => updateCfg({ multiple: e.target.checked })}
+                  className="su-input"
+                  value={cfg.relatedType || ""}
+                  onChange={(e) => updateCfg({ relatedType: e.target.value })}
+                  placeholder="intended-parents"
                 />
-                <span>Allow multiple related items</span>
+                <div className="text-[11px] text-gray-500">
+                  Must match the content type <code>slug</code>.
+                </div>
               </label>
-              <label className="flex items-center gap-2 text-xs">
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={!!cfg.multiple}
+                    onChange={(e) => updateCfg({ multiple: e.target.checked })}
+                  />
+                  <span>Allow multiple related items</span>
+                </label>
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={!!cfg.twoWay}
+                    onChange={(e) => updateCfg({ twoWay: e.target.checked })}
+                  />
+                  <span>Two-way relation (sync inverse)</span>
+                </label>
+              </div>
+              <label className="md:col-span-2 space-y-1">
+                <span className="font-medium text-xs">
+                  Inverse field key on related type
+                </span>
                 <input
-                  type="checkbox"
-                  checked={!!cfg.twoWay}
-                  onChange={(e) => updateCfg({ twoWay: e.target.checked })}
+                  className="su-input"
+                  value={cfg.inverseKey || ""}
+                  onChange={(e) => updateCfg({ inverseKey: e.target.value })}
+                  placeholder="e.g. surrogates"
                 />
-                <span>Two-way relation (sync inverse)</span>
               </label>
             </div>
-            <label className="md:col-span-2 space-y-1">
-              <span className="font-medium text-xs">
-                Inverse field key on related type
-              </span>
-              <input
-                className="su-input"
-                value={cfg.inverseKey || ""}
-                onChange={(e) => updateCfg({ inverseKey: e.target.value })}
-                placeholder="e.g. movies_for_artist"
-              />
-            </label>
-          </div>
+
+            {/* ✅ OPTION B: Inline Edit UI for relationship fields */}
+            <div className="mb-4 rounded-lg border border-gray-200 bg-white p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                Inline Edit (ServiceUp feature)
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="flex items-center gap-2 text-xs md:col-span-2">
+                  <input
+                    type="checkbox"
+                    checked={!!inlineEdit.enabled}
+                    onChange={(e) =>
+                      updateInlineEdit({ enabled: e.target.checked })
+                    }
+                  />
+                  <span>Enable inline edit for this relationship field</span>
+                </label>
+
+                <label className="space-y-1">
+                  <span className="font-medium">Display mode</span>
+                  <select
+                    className="su-input"
+                    value={inlineEdit.mode || "modal"}
+                    onChange={(e) =>
+                      updateInlineEdit({ mode: e.target.value })
+                    }
+                    disabled={!inlineEdit.enabled}
+                  >
+                    <option value="inline">
+                      Inline (shown under relationship)
+                    </option>
+                    <option value="modal">Modal (button opens editor)</option>
+                  </select>
+                </label>
+
+                <label className="space-y-1">
+                  <span className="font-medium">Modal title</span>
+                  <input
+                    className="su-input"
+                    value={inlineEdit.title || ""}
+                    onChange={(e) => updateInlineEdit({ title: e.target.value })}
+                    placeholder="Edit Intended Parent Match Details"
+                    disabled={!inlineEdit.enabled}
+                  />
+                </label>
+
+                <label className="space-y-1">
+                  <span className="font-medium">Show core fields</span>
+                  <select
+                    className="su-input"
+                    value={
+                      inlineEdit.showCore === undefined
+                        ? "false"
+                        : inlineEdit.showCore
+                        ? "true"
+                        : "false"
+                    }
+                    onChange={(e) =>
+                      updateInlineEdit({ showCore: e.target.value === "true" })
+                    }
+                    disabled={!inlineEdit.enabled}
+                  >
+                    <option value="false">No (recommended)</option>
+                    <option value="true">Yes</option>
+                  </select>
+                  <div className="text-[11px] text-gray-500">
+                    “Core fields” = title/slug style fields (if present). Usually
+                    you want this off.
+                  </div>
+                </label>
+
+                <div className="md:col-span-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="space-y-1">
+                      <div className="font-medium">Allowed fields</div>
+                      <div className="text-[11px] text-gray-500">
+                        Choose which fields are editable in the inline editor.
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        className="su-btn su-btn-xs su-btn-ghost"
+                        disabled={
+                          !inlineEdit.enabled || !relatedFieldOptions.length
+                        }
+                        onClick={() =>
+                          updateInlineEdit({
+                            fields: relatedFieldOptions.map((x) => x.key),
+                          })
+                        }
+                      >
+                        Select all
+                      </button>
+                      <button
+                        type="button"
+                        className="su-btn su-btn-xs su-btn-ghost"
+                        disabled={!inlineEdit.enabled}
+                        onClick={() => updateInlineEdit({ fields: [] })}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+
+                  {!relatedSlug ? (
+                    <div className="mt-2 text-xs text-gray-500">
+                      Enter a related content type slug above to load its fields.
+                    </div>
+                  ) : loadingRelatedFields ? (
+                    <div className="mt-2 text-xs text-gray-500">
+                      Loading fields for <code>{relatedSlug}</code>…
+                    </div>
+                  ) : !relatedTypeObj ? (
+                    <div className="mt-2 text-xs text-red-600">
+                      Could not find content type with slug{" "}
+                      <code>{relatedSlug}</code>. (It must exist before we can
+                      populate fields.)
+                    </div>
+                  ) : !relatedFieldOptions.length ? (
+                    <div className="mt-2 text-xs text-gray-500">
+                      No fields found on <code>{relatedSlug}</code> yet. Add
+                      fields to that content type, then come back here.
+                    </div>
+                  ) : (
+                    <select
+                      className="su-input mt-2"
+                      multiple
+                      value={inlineAllowedFields}
+                      disabled={!inlineEdit.enabled}
+                      onChange={(e) => {
+                        const vals = Array.from(e.target.selectedOptions).map(
+                          (o) => o.value
+                        );
+                        updateInlineEdit({ fields: vals });
+                      }}
+                      style={{ minHeight: 140 }}
+                    >
+                      {relatedFieldOptions.map((f) => (
+                        <option key={f.key} value={f.key}>
+                          {f.label} ({f.key}){f.type ? ` — ${f.type}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+
+                  <div className="text-[11px] text-gray-500 mt-2">
+                    Stored at <code>field.config.inlineEdit</code> so it can be
+                    reused anywhere in ServiceUp.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
         )}
 
-        {/* User relationship config */}
         {type === "relation_user" && (
           <div className="mb-4 grid gap-3 md:grid-cols-2">
             <div className="space-y-2">
@@ -712,7 +1030,9 @@ export default function QuickBuilderPage() {
               <input
                 className="su-input"
                 value={cfg.roleFilter || ""}
-                onChange={(e) => updateCfg({ roleFilter: e.target.value.toUpperCase() })}
+                onChange={(e) =>
+                  updateCfg({ roleFilter: e.target.value.toUpperCase() })
+                }
                 placeholder="ADMIN, EDITOR, etc."
               />
               <div className="text-[11px] text-gray-500">
@@ -738,7 +1058,6 @@ export default function QuickBuilderPage() {
           </div>
         )}
 
-        {/* Media upload config */}
         {["image", "file", "video"].includes(type) && (
           <div className="mb-4 grid gap-3 md:grid-cols-[minmax(0,2fr),minmax(0,1fr)]">
             <label className="space-y-1">
@@ -763,16 +1082,444 @@ export default function QuickBuilderPage() {
                 }
               />
             </label>
+			<div className="md:col-span-2 grid gap-2">
+				<label className="flex items-center gap-2 text-xs">
+				<input
+				type="checkbox"
+				checked={cfg.dragDropDesktop !== false}
+				onChange={(e) => updateCfg({ dragDropDesktop: e.target.checked })}
+				/>
+				<span>Enable drag & drop on desktop</span>
+			</label>
+
+			<label className="flex items-center gap-2 text-xs">
+				<input
+				type="checkbox"
+				checked={!!cfg.multipleUploads}
+				onChange={(e) => updateCfg({ multipleUploads: e.target.checked })}
+				/>
+				<span>Allow multiple uploads (disables title/caption/credit subfields)</span>
+			</label>
+			</div>
+
           </div>
         )}
 
-        {/* Subfields (name/address/media meta) */}
+        {type === "repeater" && (
+          <div className="mb-4 space-y-3">
+            <div className="font-medium">Repeater settings</div>
+
+            <div className="grid gap-3 md:grid-cols-4">
+              <label className="space-y-1">
+                <span className="font-medium text-xs">Min rows</span>
+                <input
+                  type="number"
+                  className="su-input"
+                  value={cfg.minRows ?? ""}
+                  onChange={(e) =>
+                    updateCfg({
+                      minRows:
+                        e.target.value === "" ? undefined : Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+
+              <label className="space-y-1">
+                <span className="font-medium text-xs">Max rows</span>
+                <input
+                  type="number"
+                  className="su-input"
+                  value={cfg.maxRows ?? ""}
+                  onChange={(e) =>
+                    updateCfg({
+                      maxRows:
+                        e.target.value === "" ? undefined : Number(e.target.value),
+                    })
+                  }
+                />
+              </label>
+
+              <label className="space-y-1">
+                <span className="font-medium text-xs">“Add row” label</span>
+                <input
+                  className="su-input"
+                  value={cfg.addLabel ?? "Add row"}
+                  onChange={(e) => updateCfg({ addLabel: e.target.value })}
+                />
+              </label>
+
+              <label className="space-y-1">
+                <span className="font-medium text-xs">Layout</span>
+                <select
+                  className="su-input"
+                  value={repeaterLayout}
+                  onChange={(e) => updateCfg({ layout: e.target.value })}
+                >
+                  <option value="cards">Cards</option>
+                  <option value="table">Table</option>
+                </select>
+              </label>
+
+              <label className="space-y-1 md:col-span-2">
+                <span className="font-medium text-xs">Max nesting depth</span>
+                <input
+                  type="number"
+                  className="su-input"
+                  value={maxDepth}
+                  min={1}
+                  onChange={(e) =>
+                    updateCfg({
+                      maxDepth: Math.max(1, Number(e.target.value || 1)),
+                    })
+                  }
+                />
+                <div className="text-[11px] text-gray-500">
+                  1 = no nested repeaters. 2 = allow one repeater inside another,
+                  etc.
+                </div>
+              </label>
+
+              <label className="space-y-1 md:col-span-2">
+                <span className="font-medium text-xs">
+                  Row label template (optional)
+                </span>
+                <input
+                  className="su-input"
+                  value={cfg.rowLabelTemplate ?? ""}
+                  onChange={(e) => updateCfg({ rowLabelTemplate: e.target.value })}
+                  placeholder='Example: "Item {#}: {name}"'
+                />
+                <div className="text-[11px] text-gray-500">
+                  Supports <code>{"{#}"}</code> and <code>{"{field_key}"}</code>.
+                </div>
+              </label>
+            </div>
+
+            <div className="mt-3 rounded-lg border border-gray-200 bg-white p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                Subfields
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-200 text-left">
+                      <th className="py-2 pr-2">Key</th>
+                      <th className="py-2 pr-2">Label</th>
+                      <th className="py-2 pr-2">Type</th>
+                      <th className="py-2 pr-2">Required</th>
+                      <th className="py-2 pr-2">Help text</th>
+                      <th className="py-2 pr-2">Config (JSON)</th>
+                      <th className="py-2 pr-2 text-right"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(Array.isArray(cfg.subfields) ? cfg.subfields : []).map(
+                      (sf, i) => {
+                        const configText =
+                          typeof sf?.config === "object"
+                            ? JSON.stringify(sf.config, null, 2)
+                            : sf?.configText || "";
+
+                        const typeOptions = FIELD_TYPES.filter((t) => {
+                          if (t.value !== "repeater") return true;
+                          return true;
+                        });
+
+                        return (
+                          <tr key={i} className="border-b border-gray-100 align-top">
+                            <td className="py-1 pr-2">
+                              <input
+                                className="su-input su-input-sm"
+                                value={sf.field_key || ""}
+                                onChange={(e) =>
+                                  updateRepeaterSubfield(i, {
+                                    field_key: e.target.value,
+                                  })
+                                }
+                                placeholder="subfield_key"
+                              />
+                            </td>
+
+                            <td className="py-1 pr-2">
+                              <input
+                                className="su-input su-input-sm"
+                                value={sf.label || ""}
+                                onChange={(e) =>
+                                  updateRepeaterSubfield(i, {
+                                    label: e.target.value,
+                                  })
+                                }
+                                placeholder="Subfield label"
+                              />
+                            </td>
+
+                            <td className="py-1 pr-2">
+                              <select
+                                className="su-input su-input-sm min-w-[180px]"
+                                value={sf.type || "text"}
+                                onChange={(e) =>
+                                  updateRepeaterSubfield(i, {
+                                    type: e.target.value,
+                                  })
+                                }
+                              >
+                                {typeOptions.map((t) => (
+                                  <option key={t.value} value={t.value}>
+                                    {t.label}
+                                  </option>
+                                ))}
+                              </select>
+                              {sf.type === "repeater" && (
+                                <div className="text-[11px] text-gray-500 mt-1">
+                                  Nested repeater allowed up to depth {maxDepth}.
+                                </div>
+                              )}
+                            </td>
+
+                            <td className="py-1 pr-2">
+                              <input
+                                type="checkbox"
+                                checked={!!sf.required}
+                                onChange={(e) =>
+                                  updateRepeaterSubfield(i, {
+                                    required: e.target.checked,
+                                  })
+                                }
+                              />
+                            </td>
+
+                            <td className="py-1 pr-2">
+                              <input
+                                className="su-input su-input-sm"
+                                value={sf.help_text || ""}
+                                onChange={(e) =>
+                                  updateRepeaterSubfield(i, {
+                                    help_text: e.target.value,
+                                  })
+                                }
+                                placeholder="Shown under this subfield"
+                              />
+                            </td>
+
+                            <td className="py-1 pr-2" style={{ minWidth: 260 }}>
+                              <textarea
+                                className="su-input su-input-sm"
+                                rows={4}
+                                value={configText}
+                                onChange={(e) => {
+                                  const parsed = safeJsonParse(e.target.value);
+                                  if (parsed.ok) {
+                                    updateRepeaterSubfield(i, {
+                                      config: parsed.value,
+                                      configText: undefined,
+                                    });
+                                  } else {
+                                    updateRepeaterSubfield(i, {
+                                      configText: e.target.value,
+                                    });
+                                  }
+                                }}
+                                placeholder='{"accept":"image/*"}'
+                              />
+                              <div className="text-[11px] text-gray-500 mt-1">
+                                Leave blank for none. (Must be valid JSON to save.)
+                              </div>
+                            </td>
+
+                            <td className="py-1 pr-0 text-right">
+                              <button
+                                type="button"
+                                className="su-btn su-btn-xs su-btn-danger"
+                                onClick={() => removeRepeaterSubfield(i)}
+                              >
+                                Remove
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      }
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <button
+                type="button"
+                className="su-btn su-btn-sm su-btn-ghost mt-2"
+                onClick={addRepeaterSubfield}
+              >
+                + Add subfield
+              </button>
+            </div>
+
+            <div className="mt-3 rounded-lg border border-gray-200 bg-white p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                Conditional rules (per row)
+              </div>
+
+              <div className="text-[11px] text-gray-500 mb-2">
+                Each rule reads a value in the row and then shows/hides selected
+                subfields. Rules are evaluated top-to-bottom; later rules can
+                override earlier ones.
+              </div>
+
+              {(Array.isArray(cfg.rules) ? cfg.rules : []).map((r, i) => (
+                <div
+                  key={i}
+                  className="grid gap-2 md:grid-cols-[1.2fr,1fr,1.2fr,1fr,1.6fr,auto] items-end mb-2"
+                >
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium">If field</span>
+                    <input
+                      className="su-input"
+                      value={r.ifKey || ""}
+                      onChange={(e) => updateRule(i, { ifKey: e.target.value })}
+                      placeholder="field_key"
+                    />
+                  </label>
+
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium">Operator</span>
+                    <select
+                      className="su-input"
+                      value={r.op || "equals"}
+                      onChange={(e) => updateRule(i, { op: e.target.value })}
+                    >
+                      {REPEATER_OPERATORS.map((op) => (
+                        <option key={op.value} value={op.value}>
+                          {op.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium">Value</span>
+                    <input
+                      className="su-input"
+                      value={r.value ?? ""}
+                      onChange={(e) => updateRule(i, { value: e.target.value })}
+                      placeholder="(optional)"
+                    />
+                  </label>
+
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium">Action</span>
+                    <select
+                      className="su-input"
+                      value={r.action || "show"}
+                      onChange={(e) => updateRule(i, { action: e.target.value })}
+                    >
+                      <option value="show">Show targets</option>
+                      <option value="hide">Hide targets</option>
+                    </select>
+                  </label>
+
+                  <label className="space-y-1">
+                    <span className="text-xs font-medium">Targets</span>
+                    <select
+                      className="su-input"
+                      multiple
+                      value={Array.isArray(r.targets) ? r.targets : []}
+                      onChange={(e) => {
+                        const vals = Array.from(e.target.selectedOptions).map(
+                          (o) => o.value
+                        );
+                        updateRule(i, { targets: vals });
+                      }}
+                      style={{ minHeight: 46 }}
+                    >
+                      {availableTargets.map((k) => (
+                        <option key={k} value={k}>
+                          {k}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <button
+                    type="button"
+                    className="su-btn su-btn-sm su-btn-danger"
+                    onClick={() => removeRule(i)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+
+              <button
+                type="button"
+                className="su-btn su-btn-sm su-btn-ghost"
+                onClick={addRule}
+              >
+                + Add rule
+              </button>
+            </div>
+          </div>
+        )}
+
         {supportsSubfields(type) && (
           <SubfieldControls
             type={type}
             config={cfg}
             onChange={(subCfg) => onChange(subCfg)}
           />
+        )}
+
+        {(type === "date" || type === "datetime" || type === "time") && (
+          <div className="mb-4 grid gap-3 md:grid-cols-2">
+            {type !== "time" && (
+              <label className="space-y-1">
+                <span className="font-medium">Date style</span>
+                <select
+                  className="su-input"
+                  value={cfg.dateStyle || "long"}
+                  onChange={(e) => updateCfg({ dateStyle: e.target.value })}
+                >
+                  <option value="long">Long (December 22, 2025)</option>
+                  <option value="medium">Medium</option>
+                  <option value="short">Short</option>
+                </select>
+                <div className="text-[11px] text-gray-500">
+                  Used for display in editors + lists/widgets.
+                </div>
+              </label>
+            )}
+
+            {type === "datetime" && (
+              <label className="space-y-1">
+                <span className="font-medium">Default timezone</span>
+                <input
+                  className="su-input"
+                  value={cfg.defaultTZ || "America/Los_Angeles"}
+                  onChange={(e) => updateCfg({ defaultTZ: e.target.value })}
+                  placeholder="America/Los_Angeles"
+                />
+                <div className="text-[11px] text-gray-500">
+                  Used when converting selected date+time into UTC.
+                </div>
+              </label>
+            )}
+
+            <label className="space-y-1 md:col-span-2">
+              <span className="font-medium">Locale</span>
+              <input
+                className="su-input"
+                value={cfg.locale || "en-US"}
+                onChange={(e) => updateCfg({ locale: e.target.value })}
+                placeholder="en-US"
+              />
+            </label>
+
+            {type === "time" && (
+              <div className="text-[11px] text-gray-500 md:col-span-2">
+                Time display defaults to <code>6:50pm</code> style (lowercase
+                am/pm).
+              </div>
+            )}
+          </div>
         )}
 
         {![
@@ -788,17 +1535,21 @@ export default function QuickBuilderPage() {
           "video",
           "name",
           "address",
+          "repeater",
+          "date",
+          "datetime",
+          "time",
         ].includes(type) &&
           !supportsSubfields(type) && (
             <div className="text-xs text-gray-500">
-              This field type has no extra config yet. (We can always add more later.)
+              This field type has no extra config yet. (We can always add more
+              later.)
             </div>
           )}
       </div>
     );
   }
 
-  // === RENDER ===
   return (
     <div className="space-y-6 p-6">
       <div>
@@ -827,7 +1578,11 @@ export default function QuickBuilderPage() {
         </div>
       )}
 
-      <div className="su-grid cols-3 gap-6">
+      {/* ✅ NEW LAYOUT:
+          Desktop: 2 columns (Types | Details)
+          Underneath: Fields full width
+          Mobile: stacks naturally using your su-grid rules */}
+      <div className="su-grid cols-2 gap-6">
         {/* LEFT: type list */}
         <div className="su-card self-start">
           <div className="mb-3 flex items-center justify-between">
@@ -851,10 +1606,7 @@ export default function QuickBuilderPage() {
           ) : (
             <>
               {contentTypes.length > 0 && (
-                <ul
-                  className="space-y-1"
-                  style={{ listStyle: "none", padding: 0 }}
-                >
+                <ul style={{ listStyle: "none", padding: 0 }}>
                   {contentTypes.map(renderTypeButton)}
                 </ul>
               )}
@@ -864,10 +1616,7 @@ export default function QuickBuilderPage() {
                   <div className="mt-4 mb-1 text-[11px] uppercase tracking-wide text-gray-500">
                     Taxonomies
                   </div>
-                  <ul
-                    className="space-y-1"
-                    style={{ listStyle: "none", padding: 0 }}
-                  >
+                  <ul style={{ listStyle: "none", padding: 0 }}>
                     {taxonomyTypes.map(renderTypeButton)}
                   </ul>
                 </>
@@ -876,9 +1625,8 @@ export default function QuickBuilderPage() {
           )}
         </div>
 
-        {/* RIGHT: details + fields */}
-        <div className="su-card col-span-2 space-y-6">
-          {/* TYPE DETAILS */}
+        {/* RIGHT: details only */}
+        <div className="su-card self-start">
           <form onSubmit={saveType} className="space-y-4">
             <div className="flex items-center justify-between gap-4">
               <h2 className="m-0 text-base font-medium">
@@ -965,8 +1713,10 @@ export default function QuickBuilderPage() {
               </label>
             </div>
           </form>
+        </div>
 
-          {/* FIELDS */}
+        {/* FULL WIDTH: fields */}
+        <div className="su-card col-span-2 space-y-6">
           <form onSubmit={saveFields} className="space-y-4">
             <div className="flex items-center justify-between gap-4">
               <h2 className="m-0 text-base font-medium">Fields</h2>
