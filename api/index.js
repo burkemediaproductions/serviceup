@@ -1,20 +1,12 @@
-import usersRouter from './routes/users.js';
-import taxonomiesRouter from './routes/taxonomies.js';
-import rolesRouter from './routes/roles.js';
-import {
-  normalizeEmail,
-  normalizePhoneE164,
-  normalizeUrl,
-  normalizeAddress,
-} from './lib/fieldUtils.js';
-
-import mountExtraRoutes from './extra-routes.js';
 import express from 'express';
 import dotenv from 'dotenv';
 import pg from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
+import usersRouter from './routes/users.js';
+import taxonomiesRouter from './routes/taxonomies.js';
+import rolesRouter from './routes/roles.js';
 import permissionsRouter from './routes/permissions.js';
 import settingsRouter from './routes/settings.js';
 import dashboardRouter from './routes/dashboard.js';
@@ -22,17 +14,22 @@ import contentTypesRouter from './routes/contentTypes.js';
 import entryViewsRouter from './routes/entryViews.js';
 import listViewsRouter from './routes/listViews.js';
 
-// NEW: Gizmos & Gadgets & Widgets routers
 import gizmosRouter from './routes/gizmos.js';
 import gadgetsRouter from './routes/gadgets.js';
 import widgetsRouter from './routes/widgets.js';
 import publicWidgetsRouter from './routes/publicWidgets.js';
-
-// Gizmo Packs
 import gizmoPacksRouter from './routes/gizmoPacks.js';
-
-// Frontend Renderer
 import publicSiteRouter from './routes/publicSite.js';
+
+import mountExtraRoutes from './extra-routes.js';
+import { mountGizmoPacks } from './gizmos-loader.js';
+
+import {
+  normalizeEmail,
+  normalizePhoneE164,
+  normalizeUrl,
+  normalizeAddress,
+} from './lib/fieldUtils.js';
 
 dotenv.config();
 
@@ -45,7 +42,6 @@ const ALLOW = (process.env.ALLOWED_ORIGINS || '')
   .filter(Boolean);
 
 if (ALLOW.length === 0) {
-  // Local defaults; add Netlify + custom domains via Render env ALLOWED_ORIGINS
   ALLOW.push('http://localhost:5173', 'http://localhost:5174');
 }
 
@@ -61,7 +57,10 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,PUT,DELETE,OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET,POST,PATCH,PUT,DELETE,OPTIONS'
+    );
     res.setHeader('Access-Control-Expose-Headers', 'ETag');
   }
 
@@ -105,7 +104,14 @@ app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    console.log('[HTTP]', req.method, req.path, '->', res.statusCode, Date.now() - start + 'ms');
+    console.log(
+      '[HTTP]',
+      req.method,
+      req.path,
+      '->',
+      res.statusCode,
+      Date.now() - start + 'ms'
+    );
   });
   next();
 });
@@ -121,6 +127,118 @@ pool.on('error', (err) => {
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'changeme';
+
+// ---------------------------------------------------------------------------
+// Title template helpers (server-side)
+// ---------------------------------------------------------------------------
+
+function getByPath(obj, path) {
+  if (!path) return undefined;
+  const parts = String(path)
+    .split('.')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+function asPrettyInline(value) {
+  if (value == null) return '';
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return String(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(asPrettyInline).filter(Boolean).join(', ');
+  }
+
+  if (typeof value === 'object') {
+    // common name-field shapes
+    const first = value.first || '';
+    const last = value.last || '';
+    const middle = value.middle || '';
+    const title = value.title || '';
+    const suffix = value.suffix || '';
+
+    const looksLikeName =
+      Object.prototype.hasOwnProperty.call(value, 'first') ||
+      Object.prototype.hasOwnProperty.call(value, 'last') ||
+      Object.prototype.hasOwnProperty.call(value, 'middle') ||
+      Object.prototype.hasOwnProperty.call(value, 'title') ||
+      Object.prototype.hasOwnProperty.call(value, 'suffix');
+
+    if (looksLikeName) {
+      const bits = [];
+      if (title) bits.push(String(title));
+      if (first) bits.push(String(first));
+      if (middle) bits.push(String(middle));
+      if (last) bits.push(String(last));
+      let out = bits.join(' ').trim();
+      if (suffix) out = `${out} ${suffix}`.trim();
+      return out;
+    }
+
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+
+  return String(value);
+}
+
+function deriveTitleFromTemplate(template, data) {
+  const tpl = String(template || '');
+  if (!tpl.trim()) return '';
+
+  const out = tpl.replace(/\{([^}]+)\}/g, (_, tokenRaw) => {
+    const token = String(tokenRaw || '').trim();
+    if (!token) return '';
+    const val = getByPath(data, token);
+    return asPrettyInline(val);
+  });
+
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+async function getEffectiveEditorCoreForType(contentTypeId, roleUpper) {
+  const role = String(roleUpper || '').toUpperCase();
+  try {
+    const { rows } = await pool.query(
+      `SELECT config
+         FROM entry_editor_views
+        WHERE content_type_id = $1
+        ORDER BY
+          CASE WHEN (config->'default_roles')::jsonb ? $2 THEN 1 ELSE 0 END DESC,
+          CASE WHEN is_default THEN 1 ELSE 0 END DESC,
+          updated_at DESC NULLS LAST,
+          created_at DESC NULLS LAST,
+          id ASC
+        LIMIT 1`,
+      [contentTypeId, role]
+    );
+
+    const cfg =
+      rows?.[0]?.config && typeof rows[0].config === 'object'
+        ? rows[0].config
+        : {};
+    const core = cfg?.core && typeof cfg.core === 'object' ? cfg.core : {};
+    return core;
+  } catch (e) {
+    console.warn('[getEffectiveEditorCoreForType] failed:', e?.message || e);
+    return {};
+  }
+}
 
 /* ----------------------- Helpers ----------------------------------- */
 function listRoutes(appRef) {
@@ -148,7 +266,7 @@ function listRoutes(appRef) {
 
 function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-    String(value || '').trim(),
+    String(value || '').trim()
   );
 }
 
@@ -187,25 +305,18 @@ function normalizeEntryData(fieldDefs, dataIn) {
       }
     }
     return out;
-  } catch (e) {
+  } catch {
     return dataIn;
   }
 }
 
 /**
  * Option B: auto-expand relation_user fields.
- *
- * Adds:
- *  entry._resolved = {
- *    usersById: { [uuid]: { id,email,name,role,status } },
- *    userFields: { [field_key]: { multiple, display, roleFilter, onlyActive } }
- *  }
  */
 async function attachResolvedUsersToEntries(typeId, entries) {
   const list = Array.isArray(entries) ? entries : [entries];
   if (!typeId || !list.length) return entries;
 
-  // 1) Load only the user-relation fields for this type
   const { rows: userFieldRows } = await pool.query(
     `
       SELECT field_key, type, config
@@ -218,10 +329,9 @@ async function attachResolvedUsersToEntries(typeId, entries) {
 
   if (!userFieldRows.length) return entries;
 
-  // normalize field config + compute which keys we should read from data
   const userFields = {};
   for (const f of userFieldRows) {
-    const cfg = (f.config && typeof f.config === 'object') ? f.config : {};
+    const cfg = f.config && typeof f.config === 'object' ? f.config : {};
     userFields[f.field_key] = {
       multiple: !!cfg.multiple,
       display: cfg.display || 'name_email',
@@ -230,14 +340,11 @@ async function attachResolvedUsersToEntries(typeId, entries) {
     };
   }
 
-  // 2) Gather all UUIDs referenced in entry.data[field_key]
   const idsSet = new Set();
-
   for (const entry of list) {
     const data = entry?.data && typeof entry.data === 'object' ? entry.data : {};
     for (const fieldKey of Object.keys(userFields)) {
       const v = data[fieldKey];
-
       if (Array.isArray(v)) {
         for (const maybeId of v) {
           if (isUuid(maybeId)) idsSet.add(String(maybeId));
@@ -250,7 +357,6 @@ async function attachResolvedUsersToEntries(typeId, entries) {
 
   const ids = Array.from(idsSet);
   if (!ids.length) {
-    // still attach field metadata so the UI knows how to render the field
     for (const entry of list) {
       entry._resolved = entry._resolved || {};
       entry._resolved.userFields = userFields;
@@ -259,7 +365,6 @@ async function attachResolvedUsersToEntries(typeId, entries) {
     return entries;
   }
 
-  // 3) Resolve all users in one query
   const { rows: users } = await pool.query(
     `
       SELECT id, email, name, role, status
@@ -272,7 +377,6 @@ async function attachResolvedUsersToEntries(typeId, entries) {
   const usersById = {};
   for (const u of users) usersById[u.id] = u;
 
-  // 4) Attach
   for (const entry of list) {
     entry._resolved = entry._resolved || {};
     entry._resolved.userFields = userFields;
@@ -295,6 +399,7 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+
     const user = rows[0];
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(401).json({ error: 'Invalid credentials' });
@@ -313,17 +418,27 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 function authMiddleware(req, res, next) {
-  if (req.path.startsWith('/public/')) return next();
+  const url = req.originalUrl || req.url || '';
+  const path = req.path || '';
+
+  // Global public paths
+  if (path.startsWith('/public/')) return next();
+
+  // ✅ Public gizmo pack endpoints
+  // Allows: /api/gizmos/<packSlug>/public/*
+  if (/\/api\/gizmos\/[^/]+\/public(\/|$)/.test(url)) return next();
 
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'No token provided' });
 
   const token = authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
@@ -350,9 +465,7 @@ app.get('/api/content/:slug', async (req, res) => {
       [typeId]
     );
 
-    // ✅ Option B expansion (list)
     await attachResolvedUsersToEntries(typeId, entries);
-
     res.json(entries);
   } catch (err) {
     console.error('[GET /api/content/:slug] error', err);
@@ -363,7 +476,7 @@ app.get('/api/content/:slug', async (req, res) => {
 // Create entry
 app.post('/api/content/:slug', authMiddleware, async (req, res) => {
   const typeSlug = req.params.slug;
-  const { title, slug: entrySlug, status, data } = req.body || {};
+  let { title, slug: entrySlug, status, data } = req.body || {};
 
   function slugify(str) {
     return (str || '')
@@ -379,19 +492,27 @@ app.post('/api/content/:slug', authMiddleware, async (req, res) => {
       'SELECT id FROM content_types WHERE slug = $1 LIMIT 1',
       [typeSlug]
     );
-    if (!ctRows.length) {
-      return res.status(404).json({ error: 'Content type not found' });
-    }
+    if (!ctRows.length) return res.status(404).json({ error: 'Content type not found' });
 
     const typeId = ctRows[0].id;
+
+    const roleUpper = String(req.user?.role || 'ADMIN').toUpperCase();
+    const core = await getEffectiveEditorCoreForType(typeId, roleUpper);
+
+    if (core && String(core.titleMode || '').toLowerCase() === 'template') {
+      const derived = deriveTitleFromTemplate(core.titleTemplate || '', data || {});
+      if (derived) title = derived;
+    }
 
     const safeTitle = typeof title === 'string' && title.trim() ? title.trim() : null;
     if (!safeTitle) return res.status(400).json({ error: 'Title is required' });
 
+    if ((!entrySlug || !String(entrySlug).trim()) && core?.autoSlugFromTitleIfEmpty !== false) {
+      entrySlug = slugify(safeTitle);
+    }
+
     const finalSlug =
-      typeof entrySlug === 'string' && entrySlug.trim()
-        ? entrySlug.trim()
-        : slugify(safeTitle);
+      typeof entrySlug === 'string' && entrySlug.trim() ? entrySlug.trim() : slugify(safeTitle);
 
     const finalStatus = typeof status === 'string' && status.trim() ? status.trim() : 'draft';
 
@@ -409,9 +530,7 @@ app.post('/api/content/:slug', authMiddleware, async (req, res) => {
       [typeId, safeTitle, finalSlug, finalStatus, normalizedData]
     );
 
-    // optional: attach resolved users on create response (helps immediate UI render)
     await attachResolvedUsersToEntries(typeId, rows[0]);
-
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error('[POST /api/content/:slug] error', err);
@@ -422,7 +541,11 @@ app.post('/api/content/:slug', authMiddleware, async (req, res) => {
         detail: err.detail || err.message,
       });
     }
-    res.status(500).json({ error: 'Failed to create entry', code: err.code || null, detail: err.message });
+    res.status(500).json({
+      error: 'Failed to create entry',
+      code: err.code || null,
+      detail: err.message,
+    });
   }
 });
 
@@ -439,22 +562,15 @@ app.get('/api/content/:slug/:id', authMiddleware, async (req, res) => {
 
     const typeId = ctRows[0].id;
 
-    let entryQuery;
-    let entryParams;
-    if (isUuid(id)) {
-      entryQuery = `SELECT * FROM entries WHERE id = $1 AND content_type_id = $2 LIMIT 1`;
-      entryParams = [id, typeId];
-    } else {
-      entryQuery = `SELECT * FROM entries WHERE slug = $1 AND content_type_id = $2 LIMIT 1`;
-      entryParams = [id, typeId];
-    }
+    const entryQuery = isUuid(id)
+      ? `SELECT * FROM entries WHERE id = $1 AND content_type_id = $2 LIMIT 1`
+      : `SELECT * FROM entries WHERE slug = $1 AND content_type_id = $2 LIMIT 1`;
+    const entryParams = isUuid(id) ? [id, typeId] : [id, typeId];
 
     const { rows } = await pool.query(entryQuery, entryParams);
     if (!rows.length) return res.status(404).json({ error: 'Entry not found' });
 
-    // ✅ Option B expansion (single)
     await attachResolvedUsersToEntries(typeId, rows[0]);
-
     res.json(rows[0]);
   } catch (err) {
     console.error('[GET /api/content/:slug/:id] error', err);
@@ -465,7 +581,7 @@ app.get('/api/content/:slug/:id', authMiddleware, async (req, res) => {
 // Update entry (accepts ID or slug)
 app.put('/api/content/:slug/:id', authMiddleware, async (req, res) => {
   const { slug: typeSlug, id } = req.params;
-  const { title, slug: entrySlug, status, data } = req.body || {};
+  let { title, slug: entrySlug, status, data } = req.body || {};
 
   function slugify(str) {
     return (str || '')
@@ -485,13 +601,23 @@ app.put('/api/content/:slug/:id', authMiddleware, async (req, res) => {
 
     const typeId = ctRows[0].id;
 
+    const roleUpper = String(req.user?.role || 'ADMIN').toUpperCase();
+    const core = await getEffectiveEditorCoreForType(typeId, roleUpper);
+
+    if (core && String(core.titleMode || '').toLowerCase() === 'template') {
+      const derived = deriveTitleFromTemplate(core.titleTemplate || '', data || {});
+      if (derived) title = derived;
+    }
+
     const safeTitle = typeof title === 'string' && title.trim() ? title.trim() : null;
     if (!safeTitle) return res.status(400).json({ error: 'Title is required' });
 
+    if ((!entrySlug || !String(entrySlug).trim()) && core?.autoSlugFromTitleIfEmpty !== false) {
+      entrySlug = slugify(safeTitle);
+    }
+
     const finalSlug =
-      typeof entrySlug === 'string' && entrySlug.trim()
-        ? entrySlug.trim()
-        : slugify(safeTitle);
+      typeof entrySlug === 'string' && entrySlug.trim() ? entrySlug.trim() : slugify(safeTitle);
 
     const finalStatus = typeof status === 'string' && status.trim() ? status.trim() : 'draft';
 
@@ -502,38 +628,25 @@ app.put('/api/content/:slug/:id', authMiddleware, async (req, res) => {
 
     const normalizedData = normalizeEntryData(fieldsRows, data || {});
 
-    let updated;
-    if (isUuid(id)) {
-      updated = await pool.query(
-        `UPDATE entries
-         SET title = $1,
-             slug = $2,
-             status = $3,
-             data = $4,
-             updated_at = now()
-         WHERE id = $5 AND content_type_id = $6
-         RETURNING *`,
-        [safeTitle, finalSlug, finalStatus, normalizedData, id, typeId]
-      );
-    } else {
-      updated = await pool.query(
-        `UPDATE entries
-         SET title = $1,
-             slug = $2,
-             status = $3,
-             data = $4,
-             updated_at = now()
-         WHERE slug = $5 AND content_type_id = $6
-         RETURNING *`,
-        [safeTitle, finalSlug, finalStatus, normalizedData, id, typeId]
-      );
-    }
+    const updated = isUuid(id)
+      ? await pool.query(
+          `UPDATE entries
+           SET title = $1, slug = $2, status = $3, data = $4, updated_at = now()
+           WHERE id = $5 AND content_type_id = $6
+           RETURNING *`,
+          [safeTitle, finalSlug, finalStatus, normalizedData, id, typeId]
+        )
+      : await pool.query(
+          `UPDATE entries
+           SET title = $1, slug = $2, status = $3, data = $4, updated_at = now()
+           WHERE slug = $5 AND content_type_id = $6
+           RETURNING *`,
+          [safeTitle, finalSlug, finalStatus, normalizedData, id, typeId]
+        );
 
     if (!updated.rows.length) return res.status(404).json({ error: 'Entry not found' });
 
-    // optional: attach resolved users on update response
     await attachResolvedUsersToEntries(typeId, updated.rows[0]);
-
     res.json(updated.rows[0]);
   } catch (err) {
     console.error('[PUT /api/content/:slug/:id] error', err);
@@ -544,7 +657,11 @@ app.put('/api/content/:slug/:id', authMiddleware, async (req, res) => {
         detail: err.detail || err.message,
       });
     }
-    res.status(500).json({ error: 'Failed to update entry', code: err.code || null, detail: err.message });
+    res.status(500).json({
+      error: 'Failed to update entry',
+      code: err.code || null,
+      detail: err.message,
+    });
   }
 });
 
@@ -553,20 +670,34 @@ app.put('/api/content/:slug/:id', authMiddleware, async (req, res) => {
 app.delete('/api/content/:slug/:id', authMiddleware, async (req, res) => {
   const { slug, id } = req.params;
   try {
-    const typeRes = await pool.query('SELECT id FROM content_types WHERE slug = $1 LIMIT 1', [slug]);
+    const typeRes = await pool.query(
+      'SELECT id FROM content_types WHERE slug = $1 LIMIT 1',
+      [slug]
+    );
     if (!typeRes.rows.length) return res.status(404).json({ error: 'Not found' });
     const typeId = typeRes.rows[0].id;
 
     if (isUuid(id)) {
       await pool.query('DELETE FROM entry_versions WHERE entry_id = $1', [id]);
-      const del = await pool.query('DELETE FROM entries WHERE id = $1 AND content_type_id = $2 RETURNING id', [id, typeId]);
+      const del = await pool.query(
+        'DELETE FROM entries WHERE id = $1 AND content_type_id = $2 RETURNING id',
+        [id, typeId]
+      );
       if (!del.rows.length) return res.status(404).json({ error: 'Not found' });
     } else {
-      const { rows: entryRows } = await pool.query('SELECT id FROM entries WHERE slug = $1 AND content_type_id = $2 LIMIT 1', [id, typeId]);
+      const { rows: entryRows } = await pool.query(
+        'SELECT id FROM entries WHERE slug = $1 AND content_type_id = $2 LIMIT 1',
+        [id, typeId]
+      );
       if (!entryRows.length) return res.status(404).json({ error: 'Not found' });
       const entryId = entryRows[0].id;
+
       await pool.query('DELETE FROM entry_versions WHERE entry_id = $1', [entryId]);
-      const del = await pool.query('DELETE FROM entries WHERE id = $1 AND content_type_id = $2 RETURNING id', [entryId, typeId]);
+
+      const del = await pool.query(
+        'DELETE FROM entries WHERE id = $1 AND content_type_id = $2 RETURNING id',
+        [entryId, typeId]
+      );
       if (!del.rows.length) return res.status(404).json({ error: 'Not found' });
     }
 
@@ -599,30 +730,27 @@ app.get('/api/health', (_req, res) => {
 
 /* ----------------------- Routers ----------------------------------- */
 
-// PUBLIC routes first (no auth needed for /public/*)
+// PUBLIC routes first
 app.use('/api', publicSiteRouter);
 app.use('/api', publicWidgetsRouter);
 
+// Admin/CRUD routers
 app.use('/api/content-types', authMiddleware, contentTypesRouter);
 app.use('/api/users', authMiddleware, usersRouter);
 app.use('/api/taxonomies', taxonomiesRouter);
 app.use('/api/roles', authMiddleware, rolesRouter);
 app.use('/api/permissions', authMiddleware, permissionsRouter);
-
 app.use('/api/settings', settingsRouter);
-
 app.use('/api/dashboard', authMiddleware, dashboardRouter);
-
-// editor + list views
 app.use('/api', entryViewsRouter);
 app.use('/api', listViewsRouter);
 
-// Gizmos & Gadgets & Widgets
+// Gizmos/Gadgets/Widgets admin routes (not gizmo packs)
 app.use('/api', authMiddleware, gizmosRouter);
 app.use('/api', authMiddleware, gadgetsRouter);
 app.use('/api', authMiddleware, widgetsRouter);
 
-// Gizmo Packs
+// Gizmo Packs admin endpoints
 app.use('/api/gizmo-packs', gizmoPacksRouter);
 
 // redirects
@@ -642,7 +770,20 @@ app.use((err, req, res, _next) => {
 });
 
 /* ----------------------- Listen ------------------------------------ */
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('[BOOT] ServiceUp API listening on', PORT);
+async function start() {
+  // Mount gizmo packs BEFORE listening
+  await mountGizmoPacks(app);
+
+  // Optional: show only base mount points (Express won’t show nested routes reliably)
+  console.log('[BOOT] Gizmo packs mounted (see [GIZMOS] logs above).');
+
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log('[BOOT] ServiceUp API listening on', PORT);
+  });
+}
+
+start().catch((err) => {
+  console.error('[BOOT] Failed to start:', err);
+  process.exit(1);
 });
