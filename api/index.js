@@ -99,7 +99,22 @@ process.on('uncaughtException', (err) => {
 });
 
 /* ----------------------- Parsers & logging ------------------------- */
-app.use(express.json({ limit: '2mb' }));
+const jsonParser = express.json({ limit: "2mb" });
+
+// IMPORTANT:
+// Any /api/gizmos/<slug>/webhook route must receive RAW body (for signature verification).
+// So we skip JSON parsing on ALL gizmo webhook URLs (scalable; not Stripe-specific).
+app.use((req, res, next) => {
+  const url = req.originalUrl || req.url || "";
+
+  // generic convention: /api/gizmos/<any>/webhook
+  if (/^\/api\/gizmos\/[^/]+\/webhook(\/|$)/.test(url)) {
+    return next();
+  }
+
+  return jsonParser(req, res, next);
+});
+
 
 app.use((req, res, next) => {
   const start = Date.now();
@@ -121,6 +136,7 @@ const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { require: true, rejectUnauthorized: false },
 });
+app.locals.pool = pool;
 
 pool.on('error', (err) => {
   console.error('[pg.pool error]', err);
@@ -386,97 +402,15 @@ async function attachResolvedUsersToEntries(typeId, entries) {
   return entries;
 }
 
-/**
- * Option C: auto-expand relationship fields (entry-to-entry relations).
- * Supports content_fields.type IN ('relation', 'relationship', 'relation_entry').
- *
- * Adds:
- *   _resolved.entryFields: config per relationship field
- *   _resolved.entriesById: { [entryId]: { id, title, slug, content_type_id } }
- */
-async function attachResolvedEntriesToEntries(typeId, entries) {
-  const list = Array.isArray(entries) ? entries : [entries];
-  if (!typeId || !list.length) return entries;
-
-  const REL_TYPES = ['relation', 'relationship', 'relation_entry'];
-
-  const { rows: relFieldRows } = await pool.query(
-    `
-      SELECT field_key, type, config
-      FROM content_fields
-      WHERE content_type_id = $1
-        AND type = ANY($2::text[])
-    `,
-    [typeId, REL_TYPES]
-  );
-
-  if (!relFieldRows.length) return entries;
-
-  const entryFields = {};
-  for (const f of relFieldRows) {
-    const cfg = f.config && typeof f.config === 'object' ? f.config : {};
-    entryFields[f.field_key] = {
-      multiple: !!cfg.multiple,
-      display: cfg.display || 'title',
-      // Optional future knobs:
-      // targetContentTypeId: cfg.targetContentTypeId || null,
-      // targetSlug: cfg.targetSlug || null,
-    };
-  }
-
-  // Collect referenced entry UUIDs from data payloads
-  const idsSet = new Set();
-  for (const entry of list) {
-    const data = entry?.data && typeof entry.data === 'object' ? entry.data : {};
-    for (const fieldKey of Object.keys(entryFields)) {
-      const v = data[fieldKey];
-      if (Array.isArray(v)) {
-        for (const maybeId of v) {
-          if (isUuid(maybeId)) idsSet.add(String(maybeId));
-        }
-      } else {
-        if (isUuid(v)) idsSet.add(String(v));
-      }
-    }
-  }
-
-  const ids = Array.from(idsSet);
-
-  // Always attach config, even if no IDs present in current rows
-  if (!ids.length) {
-    for (const entry of list) {
-      entry._resolved = entry._resolved || {};
-      entry._resolved.entryFields = entryFields;
-      entry._resolved.entriesById = entry._resolved.entriesById || {};
-    }
-    return entries;
-  }
-
-  // Batch fetch titles/slugs for referenced entries (across any content type)
-  const { rows: relEntries } = await pool.query(
-    `
-      SELECT id, title, slug, content_type_id
-      FROM entries
-      WHERE id = ANY($1::uuid[])
-    `,
-    [ids]
-  );
-
-  const entriesById = {};
-  for (const e of relEntries) entriesById[e.id] = e;
-
-  for (const entry of list) {
-    entry._resolved = entry._resolved || {};
-    entry._resolved.entryFields = entryFields;
-    entry._resolved.entriesById = entriesById;
-  }
-
-  return entries;
-}
-
 /* ----------------------- Debug endpoints --------------------------- */
 app.get('/__ping', (_req, res) => res.json({ ok: true, build: Date.now() }));
 app.get('/__routes', (_req, res) => res.json({ routes: listRoutes(app) }));
+app.get('/__gizmo_public', (_req, res) => {
+  res.json({
+    gizmoPublicPrefixes: app.locals?.gizmoPublicPrefixes || [],
+  });
+});
+
 
 /* ----------------------- Auth -------------------------------------- */
 app.post('/api/auth/login', async (req, res) => {
@@ -506,30 +440,44 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 function authMiddleware(req, res, next) {
-  const url = req.originalUrl || req.url || '';
-  const path = req.path || '';
+  const url = req.originalUrl || req.url || "";
+  const path = req.path || "";
 
   // Global public paths
-  if (path.startsWith('/public/')) return next();
+  if (path.startsWith("/public/")) return next();
 
-  // ✅ Public gizmo pack endpoints
-  // Allows: /api/gizmos/<packSlug>/public/*
+  // ✅ Dynamic public prefixes declared by gizmo packs
+  const publicPrefixes =
+    app.locals && Array.isArray(app.locals.gizmoPublicPrefixes)
+      ? app.locals.gizmoPublicPrefixes
+      : [];
+
+  for (const prefix of publicPrefixes) {
+    if (url === prefix || url.startsWith(prefix + "/")) {
+      return next();
+    }
+  }
+
+  // Optional fallback convention:
   if (/\/api\/gizmos\/[^/]+\/public(\/|$)/.test(url)) return next();
 
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+  if (!authHeader) return res.status(401).json({ error: "No token provided" });
 
-  const token = authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token provided' });
+  const token = authHeader.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "No token provided" });
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+    req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: "Invalid token" });
   }
 }
+
+
+
+
 
 /* ----------------------- Entries ----------------------------------- */
 
@@ -554,7 +502,6 @@ app.get('/api/content/:slug', async (req, res) => {
     );
 
     await attachResolvedUsersToEntries(typeId, entries);
-    await attachResolvedEntriesToEntries(typeId, entries);
     res.json(entries);
   } catch (err) {
     console.error('[GET /api/content/:slug] error', err);
@@ -620,7 +567,6 @@ app.post('/api/content/:slug', authMiddleware, async (req, res) => {
     );
 
     await attachResolvedUsersToEntries(typeId, rows[0]);
-    await attachResolvedEntriesToEntries(typeId, rows[0]);
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error('[POST /api/content/:slug] error', err);
@@ -661,7 +607,6 @@ app.get('/api/content/:slug/:id', authMiddleware, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Entry not found' });
 
     await attachResolvedUsersToEntries(typeId, rows[0]);
-    await attachResolvedEntriesToEntries(typeId, rows[0]);
     res.json(rows[0]);
   } catch (err) {
     console.error('[GET /api/content/:slug/:id] error', err);
@@ -738,7 +683,6 @@ app.put('/api/content/:slug/:id', authMiddleware, async (req, res) => {
     if (!updated.rows.length) return res.status(404).json({ error: 'Entry not found' });
 
     await attachResolvedUsersToEntries(typeId, updated.rows[0]);
-    await attachResolvedEntriesToEntries(typeId, updated.rows[0]);
     res.json(updated.rows[0]);
   } catch (err) {
     console.error('[PUT /api/content/:slug/:id] error', err);
